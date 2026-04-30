@@ -162,9 +162,16 @@ def resolve_column_name(input_file: Path, col_ref: str) -> str:
     try:
         df_head = pl.read_csv(str(input_file), n_rows=1)
         headers = df_head.columns
+        
+        # 1. Try direct match first (Case-insensitive)
+        for h in headers:
+            if h.lower() == col_ref.lower(): return h
+            
+        # 2. Try index or Excel notation
         idx = int(col_ref) - 1 if col_ref.isdigit() else excel_col_to_index(col_ref)
         if 0 <= idx < len(headers): return headers[idx]
-        print(f"[ERROR] Column index {idx+1} out of bounds.")
+        
+        print(f"[ERROR] Column '{col_ref}' not found or out of bounds.")
         return None
     except Exception as e:
         print(f"[FATAL] Could not read headers: {e}")
@@ -449,15 +456,6 @@ def main():
     if args.output: config['output_file'] = args.output
     
     if config.get('input_file'):
-        execute_scrub(args, config)
-    else:
-        print("[ERROR] No input file specified. Use -i or configure config.yaml")
-        parser.print_usage()
-
-
-if __name__ == "__main__":
-    main()
-_file'):
         execute_scrub(args, config)
     else:
         print("[ERROR] No input file specified. Use -i or configure config.yaml")
