@@ -21,11 +21,14 @@ import base64
 import gc
 import re
 import shlex
+import atexit
 import polars as pl
 from pathlib import Path
 from datetime import datetime, timezone
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.exceptions import InvalidSignature
 
 # --- CONSTANTS ---
 KEY_FILE = "master.key"
@@ -45,6 +48,143 @@ DEFAULT_RULES = {
 }
 
 # --- COMMON SENSE UTILITIES ---
+
+PUBLIC_KEY_B64 = "N17molbSKMKChymxDZU5P2ojYMHqzOlsFm7/FdXDNys="
+LICENSE_DIR = Path(os.path.expanduser("~/.config/sscrub")).resolve()
+LICENSE_FILE = LICENSE_DIR / "license.json"
+SESSION_FILES_LOG = LICENSE_DIR / "session_files.json"
+LICENSE_HISTORY_FILE = LICENSE_DIR / "license_history.json"
+IS_PRO_EDITION = False
+LICENSE_INFO = None
+
+def log_session_file(file_path: Path):
+    license_id = "Community Edition"
+    keep_record = False
+    if IS_PRO_EDITION and LICENSE_INFO:
+        license_id = LICENSE_INFO.get('email') or LICENSE_INFO.get('org') or "Pro Edition"
+        keep_record = LICENSE_INFO.get('keep_record', False)
+    
+    if keep_record:
+        # Persistent history record
+        history_data = {}
+        if LICENSE_HISTORY_FILE.exists():
+            try:
+                with open(LICENSE_HISTORY_FILE, "r") as f:
+                    history_data = json.load(f)
+            except Exception:
+                pass
+        if license_id not in history_data:
+            history_data[license_id] = []
+        abs_str = str(file_path.resolve())
+        if abs_str not in history_data[license_id]:
+            history_data[license_id].append(abs_str)
+        try:
+            LICENSE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(LICENSE_HISTORY_FILE, "w") as f:
+                json.dump(history_data, f, indent=2)
+        except Exception as e:
+            print(f"[!] Warning: Failed to write to license history: {e}")
+    else:
+        # Transient session record (cleared at exit)
+        data = {}
+        if SESSION_FILES_LOG.exists():
+            try:
+                with open(SESSION_FILES_LOG, "r") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+        if license_id not in data:
+            data[license_id] = []
+        abs_str = str(file_path.resolve())
+        if abs_str not in data[license_id]:
+            data[license_id].append(abs_str)
+        try:
+            LICENSE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(SESSION_FILES_LOG, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"[!] Warning: Failed to write to session log: {e}")
+
+def clear_session_files():
+    try:
+        if SESSION_FILES_LOG.exists():
+            with open(SESSION_FILES_LOG, "w") as f:
+                json.dump({}, f)
+    except Exception:
+        pass
+
+atexit.register(clear_session_files)
+
+def verify_license_key(license_key: str) -> dict:
+    if not license_key:
+        return None
+    try:
+        parts = license_key.strip().split('.')
+        if len(parts) != 2:
+            return None
+        payload_b64, signature_b64 = parts
+        
+        # Add padding back to base64 if needed
+        payload_pad = payload_b64 + '=' * (4 - len(payload_b64) % 4) if len(payload_b64) % 4 else payload_b64
+        sig_pad = signature_b64 + '=' * (4 - len(signature_b64) % 4) if len(signature_b64) % 4 else signature_b64
+        
+        json_bytes = base64.urlsafe_b64decode(payload_pad.encode('ascii'))
+        signature = base64.urlsafe_b64decode(sig_pad.encode('ascii'))
+        
+        # Load public key
+        pub_bytes = base64.b64decode(PUBLIC_KEY_B64.encode('ascii'))
+        public_key = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
+        
+        # Verify signature
+        public_key.verify(signature, json_bytes)
+        
+        # Parse payload
+        payload = json.loads(json_bytes.decode('utf-8'))
+        return payload
+    except Exception:
+        return None
+
+def load_and_verify_license() -> dict:
+    search_paths = [Path("license.json"), LICENSE_FILE]
+    for p in search_paths:
+        if p.exists():
+            try:
+                with open(p, "r") as f:
+                    content = f.read().strip()
+                try:
+                    js = json.loads(content)
+                    key = js.get("license_key", "").strip()
+                except Exception:
+                    key = content
+                
+                payload = verify_license_key(key)
+                if payload:
+                    return payload
+            except Exception:
+                pass
+    return None
+
+def initialize_licensing():
+    global IS_PRO_EDITION, LICENSE_INFO
+    payload = load_and_verify_license()
+    if payload:
+        IS_PRO_EDITION = True
+        LICENSE_INFO = payload
+
+def print_banner(shell=False):
+    global IS_PRO_EDITION, LICENSE_INFO
+    edition = "Pro Edition" if IS_PRO_EDITION else "Community Edition"
+    title = f"🛡️ SentryScrub ({edition}) v1.0"
+    print(f"\n{title}")
+    if IS_PRO_EDITION:
+        print(f"Licensed to {LICENSE_INFO['org']} ({LICENSE_INFO['email']})")
+    else:
+        print("Unlicensed for commercial use. Get Pro at sscrub.com (CAD $149)")
+    
+    if shell:
+        print("Type 'help' for commands, 'run' to execute, or 'exit' to quit.\n")
+    else:
+        print("-" * 60)
 
 def expand_path(p: str) -> Path:
     if not p: return None
@@ -85,12 +225,46 @@ def generate_vault_keys():
     with open(SALT_FILE, "wb") as f: f.write(get_random_bytes(16))
     print(f"[OK] Keys Generated: {KEY_FILE}, {SALT_FILE}")
 
-def load_vault_material():
-    if not os.path.exists(KEY_FILE):
+def load_vault_material(ephemeral=False):
+    m_salt = bytearray()
+    
+    salt_path = Path(SALT_FILE)
+    if not salt_path.exists():
+        home_salt = Path(os.path.expanduser("~/hash.salt"))
+        if home_salt.exists():
+            salt_path = home_salt
+            
+    if salt_path.exists():
+        with open(salt_path, "rb") as f: m_salt = bytearray(f.read())
+    else:
+        m_salt = bytearray(b"scrub_default_salt_2026")
+
+    if ephemeral:
+        e_key = bytearray(get_random_bytes(32))
+        e_key_b64 = base64.urlsafe_b64encode(e_key).decode('ascii')
+        
+        border = "!" * 62
+        print(f"\n{border}")
+        print("  EPHEMERAL SESSION KEY GENERATED")
+        print(border)
+        print(f"\n  KEY: {e_key_b64}\n")
+        print("  THIS KEY IS NOT SAVED TO DISK. IF YOU LOSE IT, THE DATA")
+        print("  ENCRYPTED IN THIS SESSION IS PERMANENTLY UNRECOVERABLE.")
+        print(border + "\n")
+        
+        input("  Press ENTER to confirm you have copied the key... ")
+        return e_key, m_salt
+
+    key_path = Path(KEY_FILE)
+    if not key_path.exists():
+        home_key = Path(os.path.expanduser("~/master.key"))
+        if home_key.exists():
+            key_path = home_key
+
+    if not key_path.exists():
         print(f"[ERROR] Keys missing. Run: --generate-keys")
         return None, None
-    with open(KEY_FILE, "rb") as f: m_key = bytearray(f.read())
-    with open(SALT_FILE, "rb") as f: m_salt = bytearray(f.read())
+    with open(key_path, "rb") as f: m_key = bytearray(f.read())
     return m_key, m_salt
 
 def secure_mem_wipe(ba: bytearray):
@@ -134,9 +308,18 @@ def safe_hash(val, salt: bytearray):
 
 def safe_encrypt(val, key: bytearray):
     if val is None: return None
-    cipher = AES.new(key, AES.MODE_GCM)
-    ciphertext, tag = cipher.encrypt_and_digest(str(val).encode('utf-8'))
-    return base64.b64encode(cipher.nonce + tag + ciphertext).decode('utf-8')
+    try:
+        # Use 16-byte nonce for consistency with sunseal recovery
+        nonce = get_random_bytes(16)
+        # Ensure key is a raw bytes object
+        cipher = AES.new(bytes(key), AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(str(val).encode('utf-8'))
+        # sunseal.py: raw_payload = base64.b64decode(payload_b64)
+        # nonce = raw_payload[:16], tag = raw_payload[16:32], ciphertext = raw_payload[32:]
+        payload = base64.b64encode(nonce + tag + ciphertext).decode('utf-8')
+        return payload
+    except Exception as e:
+        return f"[ENCRYPT_ERROR: {e}]"
 
 # --- CONFIG ASSISTANT ---
 
@@ -231,7 +414,11 @@ def run_discovery(input_file_override=None, range_str=None):
 # --- PIPELINE ---
 
 def execute_scrub(args, config):
-    m_key, m_salt = load_vault_material()
+    if not config.get('columns_to_scrub'):
+        print("\n[SAFETY ERROR] No columns are configured to be scrubbed. Processing halted to prevent accidental PII leakage.")
+        print("[*] Run: python3 sscrub.py discover  to auto-detect columns, or configure config.yaml.")
+        return
+    m_key, m_salt = load_vault_material(ephemeral=args.ephemeral)
     if not m_key: return
     try:
         input_path = expand_path(config['input_file'])
@@ -244,6 +431,11 @@ def execute_scrub(args, config):
                 lf = lf.select(headers[sc:ec+1]).slice(sr, (er - sr + 1) if er else None)
 
         row_count = lf.select(pl.len()).collect().item()
+        if not IS_PRO_EDITION and row_count > 50000:
+            print(f"\n[LIMIT ERROR] SentryScrub Community Edition is limited to 50,000 rows (dataset has {row_count:,} rows).")
+            print("[*] Please register a commercial license by running: sscrub --register <key>")
+            return
+
         schema = lf.collect_schema().names()
         print("\n" + "-"*30 + f"\nVAULT SUMMARY {'(TURBO)' if args.turbo else '(STREAMING)'}\n" + "-"*30)
         print(f"Rows:    {row_count:,}\nColumns: {', '.join(schema)}\n" + "-"*30 + "\n")
@@ -275,6 +467,7 @@ def execute_scrub(args, config):
         
         elapsed = time.time() - start_time
         print(f"\n[OK] SUCCESS: Data saved to {final_out}")
+        log_session_file(final_out)
         print(f"[*] Time: {elapsed:.2f} seconds.")
         generate_audit_log(config, row_count, elapsed_time=elapsed)
     except Exception as e: print(f"\n[FATAL ERROR] Pipeline stalled: {str(e)}")
@@ -284,8 +477,7 @@ def execute_scrub(args, config):
 # --- SHELL MODE ---
 
 def run_shell(parser):
-    print("\n🛡️ sscrub Interactive Shell v1.0")
-    print("Type 'help' for commands, 'run' to execute, or 'exit' to quit.\n")
+    print_banner(shell=True)
     while True:
         try:
             cmd_line = input("sscrub> ")
@@ -363,10 +555,14 @@ def main():
     parser.add_argument("--range", help="Limit processing to Excel range (e.g. A1:C10)")
     parser.add_argument("--turbo", action="store_true", help="In-memory processing (faster, higher RAM)")
     parser.add_argument("--force", action="store_true", help="Overwrite output if it exists")
+    parser.add_argument("--ephemeral", action="store_true", help="Use a one-time session key (not saved to disk)")
     parser.add_argument("--shell", action="store_true", help="Enter interactive mode")
-    parser.add_argument("command", nargs="?", choices=["add", "remove", "ignore", "learn", "exit", "help", "run", "discover"], help="Optional command to execute")
+    parser.add_argument("command", nargs="?", choices=["add", "remove", "ignore", "learn", "exit", "help", "run", "discover", "register"], help="Optional command to execute")
     parser.add_argument("-c", "--column", help="Target column for add/remove/ignore")
     parser.add_argument("-s", "--strategy", choices=["MASK", "HASH", "ENCRYPT"], help="Strategy for add/learn")
+    parser.add_argument("--register", help="Register a license key string")
+    
+    initialize_licensing()
 
     # If no arguments or --shell, enter interactive mode
     if len(sys.argv) == 1 or "--shell" in sys.argv:
@@ -374,6 +570,54 @@ def main():
         sys.exit(0)
 
     args = parser.parse_args()
+
+    # Handle license registration subcommand/flag
+    if args.command == "register" or args.register:
+        key_to_reg = args.register if args.register else input("[?] Enter your license key: ")
+        payload = verify_license_key(key_to_reg)
+        if not payload:
+            print("[ERROR] Invalid license key signature. Registration failed.")
+            sys.exit(1)
+            
+        # Display previous license's history if keep_record was active
+        if LICENSE_FILE.exists():
+            try:
+                with open(LICENSE_FILE, "r") as f:
+                    old_js = json.load(f)
+                old_key = old_js.get("license_key", "").strip()
+                old_payload = verify_license_key(old_key)
+                if old_payload and old_payload.get("keep_record"):
+                    old_email = old_payload.get("email") or old_payload.get("org") or "Pro Edition"
+                    if LICENSE_HISTORY_FILE.exists():
+                        with open(LICENSE_HISTORY_FILE, "r") as f:
+                            history = json.load(f)
+                        if old_email in history and history[old_email]:
+                            print("\n" + "="*60)
+                            print("[SECURITY AUDIT] Export History for Previous License:")
+                            print(f"Licensee: {old_payload.get('org')} ({old_payload.get('email')})")
+                            print("Files Exported:")
+                            for file_path in history[old_email]:
+                                print(f"  - {file_path}")
+                            print("="*60 + "\n")
+                            # Clear the old history once accessed
+                            history[old_email] = []
+                            with open(LICENSE_HISTORY_FILE, "w") as f:
+                                json.dump(history, f, indent=2)
+            except Exception as e:
+                print(f"[!] Warning: Failed to display audit history for previous license: {e}")
+
+        try:
+            LICENSE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(LICENSE_FILE, "w") as f:
+                json.dump({"license_key": key_to_reg.strip(), "licensee": payload}, f, indent=2)
+            print(f"[OK] SentryScrub Pro successfully registered to {payload['org']} ({payload['email']}).")
+            print(f"[*] License file written to: {LICENSE_FILE}")
+            sys.exit(0)
+        except Exception as e:
+            print(f"[ERROR] Failed to save license file: {e}")
+            sys.exit(1)
+
+    print_banner(shell=False)
 
     if args.command == "help":
         parser.print_help()
@@ -384,6 +628,7 @@ def main():
         print("  ignore -c HEADER                      Stop discovery from suggesting this header")
         print("  learn -k KEYWORD -s STRATEGY          Teach discovery a new pattern")
         print("  run [-i INPUT] [-o OUTPUT] [--turbo]  Execute the pipeline")
+        print("  register                              Register a license key")
         sys.exit(0)
 
     if args.generate_keys:
